@@ -13,6 +13,7 @@ const config: Phaser.Types.Core.GameConfig = {
     height: 720
   },
   scene: [PreloadScene, MainScene],
+  antialias: true,
   ...Canvas()
 }
 
