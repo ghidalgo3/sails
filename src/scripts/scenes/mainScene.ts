@@ -1,14 +1,21 @@
-import { ExtendedGroup, ExtendedMesh, ExtendedObject3D, Scene3D } from '@enable3d/phaser-extension'
+import { ExtendedGroup, ExtendedMesh, Scene3D } from '@enable3d/phaser-extension'
 import PhysicsBody from '@enable3d/common/dist/physicsBody';
-// import { PhysicsBody } from '@enabled3d'
-import { features } from 'process';
 import * as THREE from 'three'
-// import { AmmoPhysics, PhysicsLoader } from 'enable3d'
-// import { OrbitControls } from 'orbit-controls'
-// import { GLTFLoader } from 'gltf-loader'
 
+const WATER_DENSITY = 1000; // kg/m^3
+const DEPTH = 4;
+const waterBoxConfig = {
+  x: 0,
+  y: -DEPTH / 2,
+  z: 0,
+  width: 100,
+  height: DEPTH,
+  depth: 100,
+  name: 'water',
+}
 
 export default class MainScene extends Scene3D {
+  water: ExtendedMesh;
   constructor() {
     super({ key: 'MainScene' })
   }
@@ -22,13 +29,9 @@ export default class MainScene extends Scene3D {
   }
 
   async create() {
-    // creates a nice scene
     this.third.warpSpeed("-ground");
-
-    // Add a ground plane at Y = -10
-    this.addBottom(); // make it a static physics collider
-
-    await this.createWater();
+    this.addBottom();
+    await this.addWater();
     await this.addBoat();
   }
 
@@ -36,7 +39,8 @@ export default class MainScene extends Scene3D {
     const ground = this.third.add.plane({
       width: 100,
       height: 100,
-      y: -10,
+      y: -DEPTH,
+      name: 'ground',
       // rotation: { x: -Math.PI / 2 }
     });
     ground.receiveShadow = true; // enable shadow receiving
@@ -44,14 +48,12 @@ export default class MainScene extends Scene3D {
     this.third.physics.add.existing(ground, { mass: 0 });
   }
 
-  private async addBoat(): Promise<ExtendedGroup> {
+  private async addBoat() {
     const gltf = await this.third.load.gltf('assets/models/beneteau361.glb');
     const group = new ExtendedGroup();
+    group.name = 'boat';
     const sceneObjects: THREE.Object3D[] = [];
     const physicsObjects: any[] = [];
-
-  // const first_child = gltf.scene.children;
-
     // @ts-ignore
     gltf.scene.traverse((child) => {
       // @ts-ignore
@@ -59,28 +61,19 @@ export default class MainScene extends Scene3D {
         sceneObjects.push(child);
       }
     });
+    const massMap = {
+      "Hull": 10000,
+      "Keel": 40000
+    }
     sceneObjects.forEach((child) => {
-      child.castShadow = true; // enable shadow casting
-      child.receiveShadow = true; // enable shadow receiving
-      physicsObjects.push(group.add(child)) // difference between add and attach?
-      // const physicsObject = this.third.physics.add.existing(child);
+      child.receiveShadow = child.castShadow = true;
+      this.third.scene.add(child);
       // @ts-ignore
-      // this.third.physics.add.existing(child, {
-      //   shape: 'convex', // approximate the mesh with a convex shape
-      //   // compound: true, // use compound shape for complex meshes
-      //   // TODO read from a property
-      //   mass: 5000 / gltf.scene.children.length,
-      // });
-      // physicsObjects.push(child);
-    });
-
-    physicsObjects.forEach((child) => {
       this.third.physics.add.existing(child, {
-        shape: 'convex', // approximate the mesh with a convex shape
-        // compound: true, // use compound shape for complex meshes
-        // TODO read from a property
-        mass: 5000, // kg
+        shape: 'convex',
+        mass: massMap[child.name], // kg
       });
+      physicsObjects.push(child);
     });
 
     for (let i = 1; i < physicsObjects.length; i++) {
@@ -90,23 +83,16 @@ export default class MainScene extends Scene3D {
         true
       );
     }
-    group.position.set(0, 2, 0);
-    this.third.scene.add(group);
-    // this.third.scene.children[0]
-    // group.children[0]
-    // this.third.physics.add.existing(group);
-    // Create constraints between the physics objects
-
-    return group;
   }
 
-  private async createWater() {
+  private async addWater() {
     const textures = await Promise.all([
       this.third.load.texture('/assets/water/Water_1_M_Normal.jpg'),
       this.third.load.texture('/assets/water/Water_2_M_Normal.jpg')
     ]);
     textures[0].needsUpdate = true;
     textures[1].needsUpdate = true;
+    // Fake waves
     this.third.misc.water({
       y: 0, // lowered water level by 10 meters
       normalMap0: textures[0],
@@ -116,25 +102,67 @@ export default class MainScene extends Scene3D {
       width: 100,
       height: 100,
     });
+
+    // Why add an invisible box?
+    // To use it later on for CSG volume calculation
+    const waterBox = this.third.add.box(waterBoxConfig);
+    waterBox.visible = false;
+  }
+
+  private submergedVolume(mesh: ExtendedMesh, water: ExtendedMesh): number {
+    // const water = this.third.make.box(waterBoxConfig);
+    const clippedGeometry = this.third.csg.intersect(
+      mesh,
+      water
+    );
+    clippedGeometry.geometry.computeBoundingBox();
+    const boundingBox = clippedGeometry.geometry.boundingBox;
+
+    if (!boundingBox) return 0;
+
+    const size = new THREE.Vector3();
+    boundingBox.getSize(size);
+
+    const volume = size.x * size.y * size.z;
+    return volume;
+  }
+
+  private logSceneHierarchy(object: THREE.Object3D, depth: number = 0): void {
+    const prefix = ' '.repeat(depth * 2);
+    console.log(`${prefix}${object.name || 'Unnamed Object'} (${object.type})`);
+    object.children.forEach(child => this.logSceneHierarchy(child, depth + 1));
   }
 
   update(time: any, delta: number) {
     this.third.physics.update(delta);
     this.third.physics.updateDebugger();
 
+    // Render the scene hierarchy in camera space
+    // console.log('Scene Hierarchy:');
+    // this.logSceneHierarchy(this.third.scene);
+    const water = this.third.scene.getObjectByName('water') as ExtendedMesh;
+
     // Apply buoyancy force and damping to physics objects
-    this.third.scene.children.forEach((object: any) => {
-      if (object.body instanceof PhysicsBody && object.position.y < 0) {
+    this.third.scene.traverse((object: any) => {
+      if (object.body instanceof PhysicsBody && water) {
         const body: PhysicsBody = object.body;
-        const buoyancyForce = -object.position.y * 1000; // proportional to Y position
+        const displacementVolume = this.submergedVolume(object, water);
+        console.log('displacementVolume for ', object.name, displacementVolume);
+        const buoyancyForce = displacementVolume * WATER_DENSITY; // proportional to Y position
         object.body.applyForceY(buoyancyForce);
 
+
         // Apply damping force proportional to velocity
-        const dampingFactor = -10; // adjust damping factor as needed
+        const dampingFactor = -100; // adjust damping factor as needed
         const v = body.velocity;
-        body.applyForce(v.x * dampingFactor, v.y * dampingFactor, v.z * dampingFactor);
+        const dampingForce = new THREE.Vector3(
+          v.x * dampingFactor,
+          v.y * dampingFactor,
+          v.z * dampingFactor
+        );
+        body.applyForce(dampingForce.x, dampingForce.y, dampingForce.z);
       }
-    })
+    });
   }
 
 }
