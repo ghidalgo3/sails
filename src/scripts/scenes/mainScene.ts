@@ -11,7 +11,7 @@ const waterBoxConfig = {
   width: 100,
   height: DEPTH,
   depth: 100,
-  name: 'water',
+  name: 'waterBox',
 }
 
 export default class MainScene extends Scene3D {
@@ -31,8 +31,8 @@ export default class MainScene extends Scene3D {
   async create() {
     this.third.warpSpeed("-ground");
     this.addBottom();
-    await this.addWater();
-    await this.addBoat();
+    const water = await this.addWater();
+    await this.addBoat(water);
   }
 
   private addBottom() {
@@ -48,7 +48,7 @@ export default class MainScene extends Scene3D {
     this.third.physics.add.existing(ground, { mass: 0 });
   }
 
-  private async addBoat() {
+  private async addBoat(water: ExtendedMesh) {
     const gltf = await this.third.load.gltf('assets/models/beneteau361.glb');
     const group = new ExtendedGroup();
     group.name = 'boat';
@@ -62,8 +62,8 @@ export default class MainScene extends Scene3D {
       }
     });
     const massMap = {
-      "Hull": 10000,
-      "Keel": 40000
+      "Hull": 500,
+      "Keel": 500
     }
     sceneObjects.forEach((child) => {
       child.receiveShadow = child.castShadow = true;
@@ -83,6 +83,17 @@ export default class MainScene extends Scene3D {
         true
       );
     }
+
+    physicsObjects.forEach((pb: ExtendedMesh) => {
+      pb.body.on.collision((other: any, event) => {
+        if (other.name === 'waterBox') {
+          const buoyancyForce = this.buoyantForce(pb, water).multiplyScalar(1);
+          console.log('buoyancyForce for ', pb.name, buoyancyForce);
+          // // const buoyancyForce = displacementVolume * WATER_DENSITY; // proportional to Y position
+          pb.body.applyForce(buoyancyForce.x, buoyancyForce.y, buoyancyForce.z);
+        }
+      })
+    })
   }
 
   private async addWater() {
@@ -106,25 +117,63 @@ export default class MainScene extends Scene3D {
     // Why add an invisible box?
     // To use it later on for CSG volume calculation
     const waterBox = this.third.add.box(waterBoxConfig);
+    this.third.physics.add.existing(waterBox, { mass: 0, collisionFlags: 4 });
     waterBox.visible = false;
+    return waterBox
   }
 
-  private submergedVolume(mesh: ExtendedMesh, water: ExtendedMesh): number {
-    // const water = this.third.make.box(waterBoxConfig);
-    const clippedGeometry = this.third.csg.intersect(
-      mesh,
-      water
-    );
-    clippedGeometry.geometry.computeBoundingBox();
-    const boundingBox = clippedGeometry.geometry.boundingBox;
+  private buoyantForce(mesh: ExtendedMesh, water: ExtendedMesh): THREE.Vector3 {
+    const clippedGeometry = this.third.csg.intersect(water, mesh).geometry;
 
-    if (!boundingBox) return 0;
+    if (!clippedGeometry) {
+      console.warn('No clipped geometry found');
+      return new THREE.Vector3(0, 0, 0);
+    }
 
-    const size = new THREE.Vector3();
-    boundingBox.getSize(size);
+    // Add the clipped geometry to the scene temporarily for visualization
+    const neonMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+    const clippedMesh = new THREE.Mesh(clippedGeometry, neonMaterial);
+    // clippedMesh.scale.set(1, 1, 1);//
+    clippedMesh.position.copy(water.position);
+    // clippedMesh.position.copy(mesh.position);
+    clippedMesh.name = 'clippedMesh';
+    this.third.scene.add(clippedMesh);
+    setTimeout(() => {
+      this.third.scene.remove(clippedMesh);
+    }, 500);
 
-    const volume = size.x * size.y * size.z;
-    return volume;
+    // Integrate over the faces of the clipped geometry
+    const buoyancyForce = new THREE.Vector3();
+    const position = clippedGeometry.attributes.position;
+    const index = clippedGeometry.index;
+
+    if (index) {
+      for (let i = 0; i < index.count; i += 3) {
+        const vA = new THREE.Vector3().fromBufferAttribute(position, index.getX(i));
+        const vB = new THREE.Vector3().fromBufferAttribute(position, index.getX(i + 1));
+        const vC = new THREE.Vector3().fromBufferAttribute(position, index.getX(i + 2));
+
+        // Compute the centroid of the triangle
+        const centroid = new THREE.Vector3().addVectors(vA, vB).add(vC).divideScalar(3);
+
+        // Compute the area of the triangle
+        const edge1 = new THREE.Vector3().subVectors(vB, vA);
+        const edge2 = new THREE.Vector3().subVectors(vC, vA);
+        const triangleArea = edge1.cross(edge2).length() / 2;
+
+        // compute the triangle normal
+        const triangleNormal = edge1.cross(edge2).normalize();
+
+        // Compute the buoyancy force for the triangle
+        const depth = Math.max(0, -centroid.y); // Only consider submerged parts
+        const forceMagnitude = WATER_DENSITY * depth * triangleArea;
+        const force = triangleNormal.clone().multiplyScalar(forceMagnitude);
+
+        buoyancyForce.add(force);
+      }
+    }
+
+    return buoyancyForce;
   }
 
   private logSceneHierarchy(object: THREE.Object3D, depth: number = 0): void {
@@ -140,20 +189,27 @@ export default class MainScene extends Scene3D {
     // Render the scene hierarchy in camera space
     // console.log('Scene Hierarchy:');
     // this.logSceneHierarchy(this.third.scene);
-    const water = this.third.scene.getObjectByName('water') as ExtendedMesh;
+    const water = this.third.scene.getObjectByName('waterBox') as ExtendedMesh;
 
     // Apply buoyancy force and damping to physics objects
     this.third.scene.traverse((object: any) => {
       if (object.body instanceof PhysicsBody && water) {
+        // check if the object body intersects with the water
         const body: PhysicsBody = object.body;
-        const displacementVolume = this.submergedVolume(object, water);
-        console.log('displacementVolume for ', object.name, displacementVolume);
-        const buoyancyForce = displacementVolume * WATER_DENSITY; // proportional to Y position
-        object.body.applyForceY(buoyancyForce);
 
+
+        // Apply a torque damping force
+        const torqueDampingFactor = -100; // adjust damping factor as needed
+        const dampingTorque = new THREE.Vector3(
+          -body.angularVelocity.x * torqueDampingFactor,
+          -body.angularVelocity.y * torqueDampingFactor,
+          -body.angularVelocity.z * torqueDampingFactor
+        );
+        body.applyTorque(dampingTorque.x, dampingTorque.y, dampingTorque.z);
+        // body.applyTorque
 
         // Apply damping force proportional to velocity
-        const dampingFactor = -100; // adjust damping factor as needed
+        const dampingFactor = -1000; // adjust damping factor as needed
         const v = body.velocity;
         const dampingForce = new THREE.Vector3(
           v.x * dampingFactor,
